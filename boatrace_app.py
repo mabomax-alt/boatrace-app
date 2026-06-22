@@ -45,33 +45,58 @@ def fetch_racelist(jcd: str, date_str: str, rno: int):
         return [], url, str(e)
 
 
+def _boat_num_from_td(td) -> int | None:
+    """is-boatColor[1-6] クラスから艇番を返す。該当なければ None。"""
+    for cls in td.get("class", []):
+        m = re.fullmatch(r"is-boatColor([1-6])", cls)
+        if m:
+            return int(m.group(1))
+    return None
+
+
 def _parse_racers(soup: BeautifulSoup) -> list:
-    """soup から全艇のデータを解析する"""
+    """soup から全艇のデータを解析する。
+
+    boatrace.jp は「全艇が1つの tbody」と「艇ごとに別 tbody」の
+    両パターンが存在するため、両方に対応する。
+    艇番はクラス名 is-boatColor[1-6] から取得し、テキスト内容には依存しない。
+    """
+    all_boat_tds = soup.find_all("td", class_=re.compile(r"is-boatColor[1-6]"))
+    if not all_boat_tds:
+        return []
+
     racer_row_map: dict = {}
+    first_tbody = all_boat_tds[0].find_parent("tbody")
 
-    # ページ全体から is-boatColor[1-6] を持つ td を直接検索。
-    # table.find("tbody") は最初の tbody しか取得できないため、
-    # 艇ごとに tbody が分かれている boatrace.jp の構造に対応できない。
-    # クラス名から艇番を取得する（テキスト内容は子要素次第で変わるため使わない）。
-    for boat_td in soup.find_all("td", class_=re.compile(r"is-boatColor[1-6]")):
-        boat_num = None
-        for cls in boat_td.get("class", []):
-            m = re.fullmatch(r"is-boatColor([1-6])", cls)
-            if m:
-                boat_num = int(m.group(1))
-                break
-        if boat_num is None or boat_num in racer_row_map:
-            continue
+    # 全 boat_td が同じ tbody に属するか判定
+    one_tbody = (
+        first_tbody is not None
+        and all(td.find_parent("tbody") is first_tbody for td in all_boat_tds)
+    )
 
-        # 同じ tbody 内の全行を収集（艇ごとに tbody が別れた構造にも対応）
-        tbody = boat_td.find_parent("tbody")
-        if tbody:
-            rows = tbody.find_all("tr", recursive=False)
-        else:
-            tr = boat_td.find_parent("tr")
-            rows = [tr] if tr else []
-
-        if rows:
+    if one_tbody:
+        # パターンA: 全艇が1つの tbody — boat_td を持つ行を区切りに行をグループ化
+        current_num = None
+        for tr in first_tbody.find_all("tr", recursive=False):
+            boat_td = tr.find("td", class_=re.compile(r"is-boatColor[1-6]"))
+            if boat_td:
+                boat_num = _boat_num_from_td(boat_td)
+                if boat_num is not None:
+                    current_num = boat_num
+                    racer_row_map[current_num] = [tr]
+            elif current_num is not None:
+                racer_row_map[current_num].append(tr)
+    else:
+        # パターンB: 艇ごとに tbody が別れている — 各 tbody の全行を収集
+        for boat_td in all_boat_tds:
+            boat_num = _boat_num_from_td(boat_td)
+            if boat_num is None or boat_num in racer_row_map:
+                continue
+            tbody = boat_td.find_parent("tbody")
+            rows = tbody.find_all("tr", recursive=False) if tbody else []
+            if not rows:
+                tr = boat_td.find_parent("tr")
+                rows = [tr] if tr else []
             racer_row_map[boat_num] = rows
 
     return [_extract_racer(n, rows) for n, rows in sorted(racer_row_map.items())]
