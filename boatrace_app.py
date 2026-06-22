@@ -47,29 +47,32 @@ def fetch_racelist(jcd: str, date_str: str, rno: int):
 
 def _parse_racers(soup: BeautifulSoup) -> list:
     """soup から全艇のデータを解析する"""
-    # 艇番カラーセルを含む tbody を特定
-    tbody = None
-    for table in soup.find_all("table"):
-        tb = table.find("tbody")
-        if tb and tb.find("td", class_=re.compile(r"is-boatColor\d")):
-            tbody = tb
-            break
-
-    if tbody is None:
-        return []
-
-    # 艇番セルを起点に各艇の行をグループ化
     racer_row_map: dict = {}
-    current = None
-    for tr in tbody.find_all("tr"):
-        boat_td = tr.find("td", class_=re.compile(r"is-boatColor(\d)"))
-        if boat_td:
-            num = boat_td.get_text(strip=True)
-            if num.isdigit():
-                current = int(num)
-                racer_row_map[current] = [tr]
-        elif current is not None:
-            racer_row_map[current].append(tr)
+
+    # ページ全体から is-boatColor[1-6] を持つ td を直接検索。
+    # table.find("tbody") は最初の tbody しか取得できないため、
+    # 艇ごとに tbody が分かれている boatrace.jp の構造に対応できない。
+    # クラス名から艇番を取得する（テキスト内容は子要素次第で変わるため使わない）。
+    for boat_td in soup.find_all("td", class_=re.compile(r"is-boatColor[1-6]")):
+        boat_num = None
+        for cls in boat_td.get("class", []):
+            m = re.fullmatch(r"is-boatColor([1-6])", cls)
+            if m:
+                boat_num = int(m.group(1))
+                break
+        if boat_num is None or boat_num in racer_row_map:
+            continue
+
+        # 同じ tbody 内の全行を収集（艇ごとに tbody が別れた構造にも対応）
+        tbody = boat_td.find_parent("tbody")
+        if tbody:
+            rows = tbody.find_all("tr", recursive=False)
+        else:
+            tr = boat_td.find_parent("tr")
+            rows = [tr] if tr else []
+
+        if rows:
+            racer_row_map[boat_num] = rows
 
     return [_extract_racer(n, rows) for n, rows in sorted(racer_row_map.items())]
 
