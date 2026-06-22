@@ -54,73 +54,93 @@ def _boat_num_from_td(td) -> int | None:
     return None
 
 
+def _is_anchor_tr(tr) -> bool:
+    """tr の直接の子 td に is-boatColor[1-6] があれば True。
+    再帰検索を使わないことで、ネストされた内部テーブルの影響を排除する。"""
+    return any(
+        _boat_num_from_td(td) is not None
+        for td in tr.children
+        if getattr(td, "name", None) == "td"
+    )
+
+
 def _parse_racers(soup: BeautifulSoup) -> list:
     """soup から全艇のデータを解析する。
 
-    boatrace.jp は「全艇が1つの tbody」と「艇ごとに別 tbody」の
-    両パターンが存在するため、両方に対応する。
-    艇番はクラス名 is-boatColor[1-6] から取得し、テキスト内容には依存しない。
+    各艇の先頭 tr（anchor tr）を起点に、次の anchor tr の直前まで
+    sibling の tr を収集して行グループを作る。
+    - 艇番はクラス名から取得（テキスト内容に依存しない）
+    - anchor 判定は直接の子 td のみ対象（ネスト table を誤検知しない）
+    - 全艇が1つの tbody でも艇ごとに tbody が分かれていても動作する
     """
-    all_boat_tds = soup.find_all("td", class_=re.compile(r"is-boatColor[1-6]"))
-    if not all_boat_tds:
-        return []
-
     racer_row_map: dict = {}
-    first_tbody = all_boat_tds[0].find_parent("tbody")
 
-    # 全 boat_td が同じ tbody に属するか判定
-    one_tbody = (
-        first_tbody is not None
-        and all(td.find_parent("tbody") is first_tbody for td in all_boat_tds)
-    )
+    for td in soup.find_all("td", class_=re.compile(r"is-boatColor[1-6]")):
+        boat_num = _boat_num_from_td(td)
+        if boat_num is None or boat_num in racer_row_map:
+            continue
 
-    if one_tbody:
-        # パターンA: 全艇が1つの tbody — boat_td を持つ行を区切りに行をグループ化
-        current_num = None
-        for tr in first_tbody.find_all("tr", recursive=False):
-            boat_td = tr.find("td", class_=re.compile(r"is-boatColor[1-6]"))
-            if boat_td:
-                boat_num = _boat_num_from_td(boat_td)
-                if boat_num is not None:
-                    current_num = boat_num
-                    racer_row_map[current_num] = [tr]
-            elif current_num is not None:
-                racer_row_map[current_num].append(tr)
-    else:
-        # パターンB: 艇ごとに tbody が別れている — 各 tbody の全行を収集
-        for boat_td in all_boat_tds:
-            boat_num = _boat_num_from_td(boat_td)
-            if boat_num is None or boat_num in racer_row_map:
-                continue
-            tbody = boat_td.find_parent("tbody")
-            rows = tbody.find_all("tr", recursive=False) if tbody else []
-            if not rows:
-                tr = boat_td.find_parent("tr")
-                rows = [tr] if tr else []
-            racer_row_map[boat_num] = rows
+        first_tr = td.find_parent("tr")
+        if first_tr is None:
+            continue
+
+        # first_tr の直接親（tbody / table）から直接子 tr だけを列挙
+        container = first_tr.parent
+        if container is None:
+            racer_row_map[boat_num] = [first_tr]
+            continue
+
+        sibling_trs = [
+            child for child in container.children
+            if getattr(child, "name", None) == "tr"
+        ]
+
+        # first_tr の開始インデックスを特定
+        start_idx = next(
+            (i for i, t in enumerate(sibling_trs) if t is first_tr), None
+        )
+        if start_idx is None:
+            racer_row_map[boat_num] = [first_tr]
+            continue
+
+        # first_tr から次の anchor tr の直前まで収集
+        rows = []
+        for tr in sibling_trs[start_idx:]:
+            if tr is not first_tr and _is_anchor_tr(tr):
+                break  # 次の艇の先頭行に到達
+            rows.append(tr)
+
+        racer_row_map[boat_num] = rows
 
     return [_extract_racer(n, rows) for n, rows in sorted(racer_row_map.items())]
 
 
 def _extract_racer(boat_num: int, rows: list) -> dict:
-    """1艇分の行リストからデータを抽出する"""
+    """1艇分の行リストからデータを抽出する。
+    選手名は最初に見つかった1件のみ採用（上書きしない）。"""
     name = ""
     grade = ""
     float_vals = []
 
     for row in rows:
         for td in row.find_all("td"):
-            # 選手名: 日本語テキストを含む大きめフォントの div
-            for div in td.find_all("div"):
-                classes = " ".join(div.get("class", []))
-                text = div.get_text(strip=True)
-                if ("is-fs18" in classes or "is-fBold" in classes) and re.search(r"[぀-鿿]", text):
-                    name = text
+            # 選手名: 日本語テキストを含む大きめフォントの div（最初の1件で確定）
+            if not name:
+                for div in td.find_all("div"):
+                    classes = " ".join(div.get("class", []))
+                    text = div.get_text(strip=True)
+                    if (
+                        ("is-fs18" in classes or "is-fBold" in classes)
+                        and re.search(r"[　-鿿]", text)
+                        and not re.fullmatch(r"[AB][12]", text)
+                    ):
+                        name = text
+                        break
 
             cell_text = td.get_text(strip=True)
 
             # 級別: A1/A2/B1/B2
-            if re.fullmatch(r"[AB][12]", cell_text):
+            if not grade and re.fullmatch(r"[AB][12]", cell_text):
                 grade = cell_text
 
             # 数値 (x.xx 形式の勝率・2連率)
