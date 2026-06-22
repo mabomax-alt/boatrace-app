@@ -150,6 +150,10 @@ def generate_prediction(stadium: str, wind: float, racers: list) -> list:
             )
             scores.append(max(s, 0.01))
 
+        # 6艇未満の場合は残り枠を最小スコアで埋めて常に6要素にする
+        while len(scores) < 6:
+            scores.append(0.01)
+
         total_score = sum(scores)
         score_probs = [s / total_score for s in scores]
         # 会場バイアスとスコアを 50:50 でブレンド
@@ -253,13 +257,18 @@ with col2:
     if "江戸川" in stadium and wind_speed > 4.0:
         st.warning("⚠️ 難水面の江戸川で強風。万舟の可能性あり。")
 
-    probabilities = generate_prediction(stadium, wind_speed, racers)
-
-    predict_df = pd.DataFrame({
-        "コース (艇番)": [f"{i}号艇" for i in range(1, 7)],
-        "AI勝率予測": [f"{p * 100:.1f}%" for p in probabilities],
-    })
-    st.table(predict_df)
+    try:
+        probabilities = generate_prediction(stadium, wind_speed, racers)
+        if len(probabilities) != 6:
+            raise ValueError(f"予測値が6艇分ありません（{len(probabilities)}艇分）")
+        predict_df = pd.DataFrame({
+            "コース (艇番)": [f"{i}号艇" for i in range(1, 7)],
+            "AI勝率予測": [f"{p * 100:.1f}%" for p in probabilities],
+        })
+        st.table(predict_df)
+    except Exception as e:
+        st.error(f"予測の生成中にエラーが発生しました: {e}")
+        probabilities = [1 / 6] * 6
 
     st.subheader("おすすめ買い目（3連単）")
     for bet in recommend_bets(stadium, probabilities):
