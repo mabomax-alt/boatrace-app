@@ -5,6 +5,8 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import date
 import re
+import os
+import hmac
 
 # ===== 定数 =====
 STADIUM_CODES = {
@@ -174,7 +176,7 @@ def recommend_bets(stadium: str, probs: list) -> list:
 st.set_page_config(page_title="ボートレース予測AI", page_icon="⚓", layout="wide")
 
 # --- パスワード認証 ---
-_CORRECT_PASSWORD = "kanto2026"
+_CORRECT_PASSWORD = os.environ.get("BOATRACE_APP_PASSWORD", "")
 
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
@@ -184,7 +186,7 @@ if not st.session_state.authenticated:
     st.markdown("### ログイン")
     pw = st.text_input("パスワードを入力してください", type="password", key="pw_input")
     if st.button("ログイン", type="primary"):
-        if pw == _CORRECT_PASSWORD:
+        if _CORRECT_PASSWORD and hmac.compare_digest(pw.encode(), _CORRECT_PASSWORD.encode()):
             st.session_state.authenticated = True
             st.rerun()
         else:
