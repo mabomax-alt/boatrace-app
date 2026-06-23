@@ -45,51 +45,41 @@ def fetch_racelist(jcd: str, date_str: str, rno: int):
         return [], url, str(e)
 
 
-def _boat_num_from_td(td) -> int | None:
-    """is-boatColor[1-6] クラスから艇番を返す。該当なければ None。"""
-    for cls in td.get("class", []):
-        m = re.fullmatch(r"is-boatColor([1-6])", cls)
-        if m:
-            return int(m.group(1))
-    return None
-
-
 def _parse_racers(soup: BeautifulSoup) -> list:
-    """各艇は独自の tbody（通常4行）に格納されている。
-    先頭 tr の第1 td が is-boatColor[N] かつ is-fs14 を持つ tbody を各艇のブロックとして採用する。
-    他艇の過去成績列にも is-boatColor[N] td が出現するが、is-fs14 を持たないため除外できる。
+    """出走表テーブルから6艇分のデータブロック（tbody）を取得し、
+    インデックス順に処理する。クラス名には一切依存しない。
+
+    構造: 直接の子 tr がちょうど4本ある tbody が各艇のブロック。
+    ページ内に該当する tbody が6つ存在することを前提とする。
+    艇番は enumerate で決定（1-indexed）。
     """
-    racers: dict = {}
+    boat_tbodies = [
+        tb for tb in soup.find_all("tbody")
+        if sum(1 for c in tb.children if getattr(c, "name", None) == "tr") == 4
+    ]
 
-    for tbody in soup.find_all("tbody"):
-        direct_trs = [c for c in tbody.children if getattr(c, "name", None) == "tr"]
-        if not direct_trs:
-            continue
-
-        first_tds = [c for c in direct_trs[0].children if getattr(c, "name", None) == "td"]
-        if not first_tds:
-            continue
-
-        anchor_td = first_tds[0]
-        boat_num = _boat_num_from_td(anchor_td)
-        if boat_num is None or "is-fs14" not in anchor_td.get("class", []):
-            continue
-
-        racers[boat_num] = direct_trs
-
-    return [_extract_racer(n, rows) for n, rows in sorted(racers.items())]
+    return [
+        _extract_racer(
+            i + 1,
+            [c for c in tb.children if getattr(c, "name", None) == "tr"],
+        )
+        for i, tb in enumerate(boat_tbodies)
+    ]
 
 
 def _extract_racer(boat_num: int, rows: list) -> dict:
-    """1艇分の tbody 行リストから tr[0] の固定位置 td を直接パースしてデータを抽出する。
+    """1艇分の4行から tr[0] の固定 td インデックスでデータを抽出する。
+    クラス名には依存せず、すべて出現順（インデックス）で取得する。
 
-    td インデックス（tr[0] 基準）:
-      td[0]: 艇番 (is-boatColor[N] is-fs14)
-      td[2]: 登録番号/級別 + 選手名 + 属性
-      td[4]: 全国勝率・2連率・3連率 (連結文字列)
-      td[5]: 当地勝率・2連率・3連率 (連結文字列)
-      td[6]: モーター 出走数+2連率+3連率 (連結文字列)
-      td[7]: ボート 出走数+2連率+3連率 (連結文字列)
+    tr[0] の td レイアウト:
+      td[0] : 艇番セル
+      td[1] : 空
+      td[2] : 選手情報セル — div[0]=登録番号/級別, div[1]=選手名, div[2]=属性
+      td[3] : F/L/平均ST
+      td[4] : 全国勝率・2連率・3連率（連結文字列）
+      td[5] : 当地勝率・2連率・3連率（連結文字列）
+      td[6] : モーター 出走数+2連率+3連率（連結文字列）
+      td[7] : ボート 出走数+2連率+3連率（連結文字列）
     """
     empty = {
         "艇番": boat_num, "選手名": f"{boat_num}号艇", "級別": "",
@@ -102,18 +92,17 @@ def _extract_racer(boat_num: int, rows: list) -> dict:
 
     tds = [c for c in rows[0].children if getattr(c, "name", None) == "td"]
 
+    # td[2] の div を出現順に取得 — div[0]=登録番号/級別, div[1]=選手名
     name = ""
     grade = ""
     if len(tds) > 2:
-        td2 = tds[2]
-        name_div = td2.find("div", class_="is-fs18")
-        if name_div:
-            name = name_div.get_text(strip=True)
-        for div in td2.find_all("div", class_="is-fs11"):
-            m = re.search(r"[AB][12]", div.get_text(strip=True))
+        divs = tds[2].find_all("div")
+        if len(divs) > 1:
+            name = divs[1].get_text(strip=True)
+        if divs:
+            m = re.search(r"[AB][12]", divs[0].get_text(strip=True))
             if m:
                 grade = m.group()
-                break
 
     def _floats(idx: int) -> list:
         """全国/当地セル用: '6.8554.7269.81' → [6.85, 54.72, 69.81]"""
@@ -122,7 +111,7 @@ def _extract_racer(boat_num: int, rows: list) -> dict:
         return [float(v) for v in re.findall(r"\d+\.\d{2}", tds[idx].get_text(strip=True))]
 
     def _two_rate(idx: int) -> float:
-        """モーター/ボートセル用: '3732.2654.84' → 32.26 (先頭の XX.XX パターン)"""
+        """モーター/ボートセル用: '3732.2654.84' → 32.26（先頭の XX.XX パターン）"""
         if len(tds) <= idx:
             return 0.0
         vals = re.findall(r"\d{2}\.\d{2}", tds[idx].get_text(strip=True))
