@@ -193,7 +193,7 @@ def recommend_bets(stadium: str, probs: list) -> list:
 
 # ===== UI =====
 
-st.set_page_config(page_title="ボートレース予測AI", page_icon="⚓", layout="wide")
+st.set_page_config(page_title="ボートレース予測AI", page_icon="⚓", layout="centered")
 
 # --- パスワード認証 ---
 _CORRECT_PASSWORD = os.environ.get("BOATRACE_APP_PASSWORD", "")
@@ -205,7 +205,7 @@ if not st.session_state.authenticated:
     st.title("⚓ ボートレース予測AI")
     st.markdown("### ログイン")
     pw = st.text_input("パスワードを入力してください", type="password", key="pw_input")
-    if st.button("ログイン", type="primary"):
+    if st.button("ログイン", type="primary", use_container_width=True):
         if _CORRECT_PASSWORD and hmac.compare_digest(pw.encode(), _CORRECT_PASSWORD.encode()):
             st.session_state.authenticated = True
             st.rerun()
@@ -213,17 +213,25 @@ if not st.session_state.authenticated:
             st.error("パスワードが正しくありません。")
     st.stop()
 
-st.title("⚓ 関東限定 ボートレース予測AIアプリ")
-st.caption("桐生・戸田・江戸川・平和島・多摩川の5会場に特化した予測システム")
+st.title("⚓ ボートレース予測AI")
+st.caption("関東5会場（桐生・戸田・江戸川・平和島・多摩川）専用")
 
-# サイドバー
-st.sidebar.header("レース情報の入力")
-stadium = st.sidebar.selectbox("開催会場を選択してください", list(STADIUM_CODES.keys()))
-race_date = st.sidebar.date_input("開催日", value=date.today())
-race_num = st.sidebar.slider("レース番号", 1, 12, 12)
-weather_condition = st.sidebar.selectbox("天候", ["晴", "曇", "雨", "雪"])
-wind_speed = st.sidebar.number_input("風速 (m/s)", min_value=0.0, max_value=15.0, value=2.0, step=0.5)
-fetch_btn = st.sidebar.button("データ取得", type="primary", use_container_width=True)
+# --- 入力フォーム（サイドバー廃止・メイン1カラムに統合）---
+stadium = st.selectbox("開催会場", list(STADIUM_CODES.keys()))
+
+c1, c2 = st.columns(2)
+with c1:
+    race_date = st.date_input("開催日", value=date.today())
+with c2:
+    race_num = st.number_input("レース番号", min_value=1, max_value=12, value=12, step=1)
+
+c3, c4 = st.columns(2)
+with c3:
+    weather_condition = st.selectbox("天候", ["晴", "曇", "雨", "雪"])
+with c4:
+    wind_speed = st.number_input("風速 (m/s)", min_value=0.0, max_value=15.0, value=2.0, step=0.5)
+
+fetch_btn = st.button("データ取得", type="primary", use_container_width=True)
 
 # セッション状態
 if "racers" not in st.session_state:
@@ -239,53 +247,62 @@ if fetch_btn:
         racers, url, error = fetch_racelist(jcd, date_str, race_num)
     st.session_state.fetch_url = url
     if error:
-        st.sidebar.error(f"取得失敗: {error}")
+        st.error(f"取得失敗: {error}")
         st.session_state.racers = []
     elif not racers:
-        st.sidebar.warning("出走表が取得できませんでした。日付・会場・レース番号を確認してください。")
+        st.warning("出走表が取得できませんでした。日付・会場・レース番号を確認してください。")
         st.session_state.racers = []
     else:
         st.session_state.racers = racers
-        st.sidebar.success(f"{len(racers)}艇分のデータを取得しました！")
+        st.success(f"{len(racers)}艇分のデータを取得しました！")
 
 racers = st.session_state.racers
 
-# メイン表示
-col1, col2 = st.columns([1.3, 1])
+st.divider()
 
-with col1:
-    st.subheader(f"【{stadium}】 第{race_num}レース")
+# --- AI予測結果 ---
+st.subheader(f"【{stadium}】 第{int(race_num)}レース")
 
-    if racers:
-        st.markdown("##### 出走表（boatrace.jp より取得）")
+if "江戸川" in stadium and wind_speed > 4.0:
+    st.warning("⚠️ 難水面の江戸川で強風。万舟の可能性あり。")
+
+try:
+    probabilities = generate_prediction(stadium, wind_speed, racers)
+    if len(probabilities) != 6:
+        raise ValueError(f"予測値が6艇分ありません（{len(probabilities)}艇分）")
+except Exception as e:
+    st.error(f"予測の生成中にエラーが発生しました: {e}")
+    probabilities = [1 / 6] * 6
+
+# 予測を2列×3行で表示
+BOAT_COLORS = ["🔴", "⚫", "⬜", "🔵", "🟡", "🟢"]
+for row in range(3):
+    left, right = st.columns(2)
+    for col, idx in zip([left, right], [row * 2, row * 2 + 1]):
+        name = racers[idx]["選手名"] if idx < len(racers) else f"{idx + 1}号艇"
+        grade = racers[idx]["級別"] if idx < len(racers) else ""
+        with col:
+            st.metric(
+                label=f"{BOAT_COLORS[idx]} {idx + 1}号艇　{name}　{grade}",
+                value=f"{probabilities[idx] * 100:.1f}%",
+            )
+
+st.divider()
+
+# --- おすすめ買い目 ---
+st.subheader("おすすめ買い目（3連単）")
+for bet in recommend_bets(stadium, probabilities):
+    st.success(f"## {bet}")
+
+# --- 出走表（折りたたみ）---
+if racers:
+    st.divider()
+    with st.expander("出走表（詳細）"):
         df = pd.DataFrame(racers)
-        display_cols = ["艇番", "選手名", "級別", "当地勝率", "全国勝率", "モーター2連率", "ボート2連率"]
+        display_cols = ["艇番", "選手名", "級別", "当地勝率", "全国勝率", "モーター2連率"]
         df_display = df[[c for c in display_cols if c in df.columns]].set_index("艇番")
         st.dataframe(df_display, use_container_width=True)
         if st.session_state.fetch_url:
             st.caption(f"取得元: {st.session_state.fetch_url}")
-    else:
-        st.info("サイドバーの「データ取得」を押すと boatrace.jp から出走表を取得し、予測精度が向上します。")
-
-with col2:
-    st.subheader("AI予測結果")
-
-    if "江戸川" in stadium and wind_speed > 4.0:
-        st.warning("⚠️ 難水面の江戸川で強風。万舟の可能性あり。")
-
-    try:
-        probabilities = generate_prediction(stadium, wind_speed, racers)
-        if len(probabilities) != 6:
-            raise ValueError(f"予測値が6艇分ありません（{len(probabilities)}艇分）")
-        predict_df = pd.DataFrame({
-            "コース (艇番)": [f"{i}号艇" for i in range(1, 7)],
-            "AI勝率予測": [f"{p * 100:.1f}%" for p in probabilities],
-        })
-        st.table(predict_df)
-    except Exception as e:
-        st.error(f"予測の生成中にエラーが発生しました: {e}")
-        probabilities = [1 / 6] * 6
-
-    st.subheader("おすすめ買い目（3連単）")
-    for bet in recommend_bets(stadium, probabilities):
-        st.success(f"**{bet}**")
+else:
+    st.info("「データ取得」を押すと boatrace.jp から出走表を取得し、予測精度が向上します。")
