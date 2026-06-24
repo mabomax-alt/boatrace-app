@@ -113,6 +113,7 @@ def _extract_racer(boat_num: int, rows: list) -> dict:
         "全国勝率": 0.0, "全国2連率": 0.0,
         "当地勝率": 0.0, "当地2連率": 0.0,
         "モーター2連率": 0.0, "ボート2連率": 0.0,
+        "平均ST": 0.18,
     }
     if not rows:
         return empty
@@ -122,6 +123,7 @@ def _extract_racer(boat_num: int, rows: list) -> dict:
     # td[2] の div を出現順に取得 — div[0]=登録番号/級別, div[1]=選手名
     name = ""
     grade = ""
+    avg_st = 0.18
     if len(tds) > 2:
         divs = tds[2].find_all("div")
         if len(divs) > 1:
@@ -130,6 +132,10 @@ def _extract_racer(boat_num: int, rows: list) -> dict:
             m = re.search(r"[AB][12]", divs[0].get_text(strip=True))
             if m:
                 grade = m.group()
+    if len(tds) > 3:
+        m = re.search(r"0\.\d{2}", tds[3].get_text(strip=True))
+        if m:
+            avg_st = float(m.group())
 
     def _floats(idx: int) -> list:
         """全国/当地セル用: '6.8554.7269.81' → [6.85, 54.72, 69.81]"""
@@ -157,6 +163,7 @@ def _extract_racer(boat_num: int, rows: list) -> dict:
         "当地2連率": local[1] if len(local) > 1 else 0.0,
         "モーター2連率": _two_rate(6),
         "ボート2連率": _two_rate(7),
+        "平均ST": avg_st,
     }
 
 
@@ -242,60 +249,153 @@ def base_probs(stadium: str) -> list:
         return [0.40, 0.20, 0.17, 0.12, 0.07, 0.04]
 
 
+def _gen_formations(firsts: list, seconds: list, thirds: list) -> list:
+    """3連単フォーメーションを生成する（重複・同艇除外）"""
+    bets: list = []
+    for f in firsts:
+        for s in seconds:
+            if s == f:
+                continue
+            for t in thirds:
+                if t == f or t == s:
+                    continue
+                bet = f"{f}-{s}-{t}"
+                if bet not in bets:
+                    bets.append(bet)
+    return bets
+
+
 def generate_prediction(
     stadium: str,
     wind_speed: float,
     wind_dir_code: int,
     racers: list,
-) -> list:
-    """出走表・直前情報・気象情報を組み合わせてAI予測確率を生成する。
+) -> tuple[list, dict]:
+    """4ステップのルールベース重み付けでAI予測確率を生成する。
 
-    特徴量:
-      [既存] 当地勝率・全国勝率・モーター2連率・級別
-      [追加] 展示タイム: 平均より速い艇を微増、遅い艇を微減
-      [追加] チルト: プラスチルト→外艇（ダッシュ）有利、マイナス→内艇有利
-      [追加] 風向: 追い風系→1コース微増、強い向かい風→外艇微増
+    ステップ1: 軸の決定（1号艇の精査）
+    ステップ2: 対抗（2番手）の探索
+    ステップ3: 風と展示による展開補正
+    ステップ4: レースタイプ判定（buy_recommendations と連動）
+
+    Returns:
+        probs: 6艇分の予測確率（正規化済み）
+        analysis: レースタイプ・軸・対抗・一番時計などの分析メタデータ
     """
     probs = base_probs(stadium)[:]
+    analysis: dict = {
+        "axis_type": "normal",      # "strong" | "normal" | "upset_risk"
+        "race_type": "normal",      # "favorite" | "normal" | "upset"
+        "counter_boat": None,       # 2番手候補の艇番（1-indexed）
+        "fastest_tenji_boat": None, # 展示一番時計の艇番（1-indexed）
+        "is_tailwind": False,
+        "is_strong_headwind": False,
+    }
+
+    is_tailwind = wind_dir_code in _TAIL_WIND_CODES
+    is_headwind = wind_dir_code in _HEAD_WIND_CODES
+    is_strong_headwind = is_headwind and wind_speed >= 5.0
+    analysis["is_tailwind"] = is_tailwind
+    analysis["is_strong_headwind"] = is_strong_headwind
 
     if "江戸川" in stadium and wind_speed > 4.0:
         probs = [0.30, 0.15, 0.15, 0.15, 0.13, 0.12]
 
-    if racers:
-        scores = []
-        for r in racers:
-            s = (
-                r["当地勝率"] * 0.5
-                + r["全国勝率"] * 0.3
-                + (r["モーター2連率"] / 100.0) * 0.1
-                + GRADE_SCORE.get(r["級別"], 0.5) * 0.1
-            )
-            scores.append(max(s, 0.01))
+    if not racers:
+        return probs, analysis
 
-        while len(scores) < 6:
-            scores.append(0.01)
+    # ===== 基本スコア（当地勝率・全国勝率・モーター・級別）=====
+    scores = []
+    for r in racers:
+        s = (
+            r.get("当地勝率", 0.0) * 0.5
+            + r.get("全国勝率", 0.0) * 0.3
+            + (r.get("モーター2連率", 0.0) / 100.0) * 0.1
+            + GRADE_SCORE.get(r.get("級別", ""), 0.5) * 0.1
+        )
+        scores.append(max(s, 0.01))
 
-        total_score = sum(scores)
-        score_probs = [s / total_score for s in scores]
-        probs = [0.5 * p + 0.5 * sp for p, sp in zip(probs, score_probs)]
+    while len(scores) < 6:
+        scores.append(0.01)
 
-    # --- 展示タイム補正 ---
-    # 展示タイムが速い（値が小さい）艇ほど当日のエンジン状態が良い
+    total_score = sum(scores)
+    score_probs = [s / total_score for s in scores]
+    probs = [0.5 * p + 0.5 * sp for p, sp in zip(probs, score_probs)]
+
+    # ===== ステップ1: 軸の決定（1号艇の精査）=====
+    boat1 = racers[0]
+    boat1_local = boat1.get("当地勝率", 0.0)
+    boat1_nat = boat1.get("全国勝率", 0.0)
+    boat1_rate = boat1_local if boat1_local > 0 else boat1_nat
+    boat1_st = boat1.get("平均ST", 0.18)
+
+    others_nat = [r.get("全国勝率", 0.0) for r in racers[1:]]
+    avg_others_nat = sum(others_nat) / max(len(others_nat), 1)
+
+    if boat1_rate >= 5.5 and is_tailwind:
+        axis_type = "strong"
+        probs[0] *= 1.20  # 本命強化
+    elif boat1_rate < 4.5 and (boat1_st > 0.18 or boat1_rate < avg_others_nat):
+        axis_type = "upset_risk"
+        probs[0] *= 0.85  # イン飛び警戒
+    else:
+        axis_type = "normal"
+
+    analysis["axis_type"] = axis_type
+
+    # ===== ステップ2: 対抗（2番手）の探索 =====
+    # 2〜4号艇（センター勢）: 全国勝率最高 + モーター2連率40%以上を評価
+    counter_boat = None
+    counter_best = -1.0
+
+    for i in range(1, min(4, len(racers))):  # インデックス1〜3 → 2〜4号艇
+        r = racers[i]
+        nat_rate = r.get("全国勝率", 0.0)
+        motor2 = r.get("モーター2連率", 0.0)
+        score = nat_rate + (1.0 if motor2 >= 40 else 0.0)
+        if score > counter_best:
+            counter_best = score
+            counter_boat = i
+
+    if counter_boat is not None:
+        probs[counter_boat] *= 1.10
+        if racers[counter_boat].get("モーター2連率", 0.0) >= 40:
+            probs[counter_boat] *= 1.05  # モーター好調でさらに加点
+
+    analysis["counter_boat"] = counter_boat + 1 if counter_boat is not None else None
+
+    # ===== ステップ3: 風と展示による展開補正 =====
+    if is_strong_headwind:
+        probs[0] *= 0.90  # 向かい風強風でインをさらに弱体化
+        for i in range(2, 6):  # 3〜6号艇（ダッシュ勢）を強化
+            probs[i] *= 1.05
+    elif is_tailwind and wind_speed >= 3.0:
+        probs[0] *= 1.05
+
+    # 展示タイム補正（速い艇を加点、一番時計艇を特定）
     tenji_times = [
         racers[i].get("展示タイム", 0.0) if i < len(racers) else 0.0
         for i in range(6)
     ]
     valid_times = [t for t in tenji_times if t > 0]
+
     if valid_times:
         mean_t = sum(valid_times) / len(valid_times)
         for i, t in enumerate(tenji_times):
             if t > 0:
-                # 差×0.5 → 0.1秒速ければ約+0.05、遅ければ-0.05
                 probs[i] = max(probs[i] + (mean_t - t) * 0.5, 0.001)
 
-    # --- チルト補正 ---
-    # プラス: ダッシュ艇有利 → アウトコース(4-6)を微増
-    # マイナス: スロー安定走行 → インコース(1-3)を微増
+        fastest_idx = min(
+            (i for i, t in enumerate(tenji_times) if t > 0),
+            key=lambda i: tenji_times[i],
+        )
+        analysis["fastest_tenji_boat"] = fastest_idx + 1
+
+        # ダッシュ枠（3〜6号艇）の一番時計 × 向かい風 → 頭の可能性を強く加点
+        if fastest_idx >= 2 and is_headwind:
+            probs[fastest_idx] *= 1.10
+
+    # チルト補正
     for i in range(min(len(racers), 6)):
         tilt = racers[i].get("チルト", 0.0)
         boat = i + 1
@@ -306,30 +406,83 @@ def generate_prediction(
             factor = 0.005 if boat <= 3 else -0.003
             probs[i] = max(probs[i] + factor * abs(tilt), 0.001)
 
-    # --- 風向補正 ---
-    # 追い風: 1コース（イン）の加速を後押し → 1号艇微増
-    # 向かい風強風: スタート乱れやすくアウト艇有利
-    if wind_speed > 3.0 and wind_dir_code > 0:
-        if wind_dir_code in _TAIL_WIND_CODES:
-            probs[0] *= 1.05
-        elif wind_dir_code in _HEAD_WIND_CODES and wind_speed > 5.0:
-            for i in range(3, 6):
-                probs[i] *= 1.03
+    # 江戸川特殊処理（強風時は外艇全体を底上げ）
+    if "江戸川" in stadium and wind_speed > 4.0:
+        for i in range(1, 6):
+            probs[i] *= 1.05
 
     total = sum(probs)
-    return [p / total for p in probs]
+    probs = [p / total for p in probs]
 
-
-def recommend_bets(stadium: str, probs: list) -> list:
-    ranking = sorted(range(6), key=lambda i: -probs[i])
-    a, b, c = ranking[0] + 1, ranking[1] + 1, ranking[2] + 1
-
-    if "戸田" in stadium:
-        return [f"{a}-{b}-全", f"3-1-全", f"4-1-全"]
-    elif "多摩川" in stadium:
-        return [f"{a}-{b}-{c}", f"{a}-{b}-全", f"{a}-全-{b}"]
+    # ===== ステップ4: レースタイプ判定 =====
+    if axis_type == "strong" and not is_strong_headwind:
+        race_type = "favorite"
+    elif axis_type == "upset_risk" or is_strong_headwind:
+        race_type = "upset"
     else:
-        return [f"{a}-{b}-全", f"{a}-全-{b}", f"{b}-{a}-全"]
+        race_type = "normal"
+
+    analysis["race_type"] = race_type
+    return probs, analysis
+
+
+def recommend_bets(probs: list, analysis: dict) -> list:
+    """ステップ4: レースタイプに応じた買い目絞り込み
+
+    本命レース: 4〜8点（軸固定フォーメーション）
+    通常レース: 8〜12点（標準フォーメーション）
+    穴レース:  12〜20点（広フォーメーション）
+    """
+    race_type = analysis.get("race_type", "normal")
+    axis_type = analysis.get("axis_type", "normal")
+
+    ranking = sorted(range(6), key=lambda i: -probs[i])
+    boats = [r + 1 for r in ranking]  # 確率高い順の艇番（1-indexed）
+
+    if race_type == "favorite":
+        # 本命レース: 軸を1着固定、2着×3着をコンパクトに展開
+        axis = 1 if axis_type == "strong" else boats[0]
+        seconds = [b for b in boats if b != axis][:2]
+        thirds = [b for b in boats if b != axis][:3]
+        bets = _gen_formations([axis], seconds, thirds)
+
+        if len(bets) < 4:  # 最低4点保証
+            seconds = [b for b in boats if b != axis][:3]
+            thirds = [b for b in boats if b != axis][:4]
+            bets = _gen_formations([axis], seconds, thirds)[:8]
+        else:
+            bets = bets[:8]
+
+    elif race_type == "upset":
+        # 穴レース: 上位3艇が1着候補、上位5艇まで3着候補に広げる
+        firsts = boats[:3]
+        seconds = boats[:4]
+        thirds = boats[:5]
+        bets = _gen_formations(firsts, seconds, thirds)[:20]
+
+        if len(bets) < 12:  # 最低12点保証
+            firsts = boats[:4]
+            bets = _gen_formations(firsts, seconds, thirds)[:20]
+
+    else:
+        # 通常レース: 軸1着+対抗1着の2軸フォーメーション
+        axis = boats[0]
+        seconds = [b for b in boats if b != axis][:3]
+        thirds = [b for b in boats if b != axis][:4]
+        bets = _gen_formations([axis], seconds, thirds)
+
+        # 2番手を1着に立てた追加フォーメーション
+        if len(boats) >= 2:
+            axis2 = boats[1]
+            s2 = [b for b in boats[:4] if b != axis2]
+            t2 = [b for b in boats[:5] if b != axis2]
+            extra = _gen_formations([axis2], s2, t2)
+            all_bets = list(dict.fromkeys(bets + extra))[:12]
+            bets = all_bets
+        else:
+            bets = bets[:12]
+
+    return bets if bets else [f"{boats[0]}-{boats[1]}-{boats[2]}"]
 
 
 # ===== UI =====
@@ -453,16 +606,36 @@ st.subheader(f"【{stadium}】 第{int(race_num)}レース")
 if "江戸川" in stadium and wind_speed > 4.0:
     st.warning("⚠️ 難水面の江戸川で強風。万舟の可能性あり。")
 
+_EMPTY_ANALYSIS: dict = {
+    "axis_type": "normal", "race_type": "normal",
+    "counter_boat": None, "fastest_tenji_boat": None,
+    "is_tailwind": False, "is_strong_headwind": False,
+}
+
 try:
-    probabilities = generate_prediction(stadium, wind_speed, wind_dir_code, merged_racers)
+    probabilities, analysis = generate_prediction(stadium, wind_speed, wind_dir_code, merged_racers)
     if len(probabilities) != 6:
         raise ValueError(f"予測値が6艇分ありません（{len(probabilities)}艇分）")
 except Exception as e:
     st.error(f"予測の生成中にエラーが発生しました: {e}")
     probabilities = [1 / 6] * 6
+    analysis = _EMPTY_ANALYSIS.copy()
+
+# --- レースタイプバナー ---
+race_type = analysis.get("race_type", "normal")
+axis_type = analysis.get("axis_type", "normal")
+if race_type == "favorite":
+    st.success("🎯 **本命レース** — 1号艇の軸が堅い。点数を絞って高回収を狙う。")
+elif race_type == "upset":
+    st.warning("⚡ **穴レース** — 波乱の可能性あり。フォーメーションを広げて高配当を狙う。")
+else:
+    st.info("📊 **通常レース** — 標準フォーメーションで安定を狙う。")
 
 # 予測を2列×3行で表示
 BOAT_COLORS = ["🔴", "⚫", "⬜", "🔵", "🟡", "🟢"]
+fastest_tenji = analysis.get("fastest_tenji_boat")
+counter_boat = analysis.get("counter_boat")
+
 for row in range(3):
     left, right = st.columns(2)
     for col, idx in zip([left, right], [row * 2, row * 2 + 1]):
@@ -471,22 +644,58 @@ for row in range(3):
         grade = r.get("級別", "")
         tenji = r.get("展示タイム", 0.0)
         tilt = r.get("チルト", 0.0)
-        tenji_str = f"展示{tenji:.2f}" if tenji > 0 else ""
-        tilt_str = f"チルト{tilt:+.1f}" if tilt != 0.0 else ""
-        sub = "　".join(filter(None, [tenji_str, tilt_str]))
+        avg_st = r.get("平均ST", 0.0)
+        boat_no = idx + 1
+
+        tags = []
+        if tenji > 0:
+            tags.append(f"展示{tenji:.2f}")
+        if tilt != 0.0:
+            tags.append(f"チルト{tilt:+.1f}")
+        if avg_st > 0:
+            tags.append(f"ST{avg_st:.2f}")
+        if fastest_tenji == boat_no:
+            tags.append("⚡一番時計")
+        if counter_boat == boat_no:
+            tags.append("🥈対抗")
+
+        sub = "　".join(tags)
         with col:
             st.metric(
-                label=f"{BOAT_COLORS[idx]} {idx + 1}号艇　{name}　{grade}",
+                label=f"{BOAT_COLORS[idx]} {boat_no}号艇　{name}　{grade}",
                 value=f"{probabilities[idx] * 100:.1f}%",
                 delta=sub if sub else None,
                 delta_color="off",
             )
 
+# --- 分析サマリー ---
+if counter_boat or fastest_tenji:
+    ac1, ac2 = st.columns(2)
+    with ac1:
+        if counter_boat:
+            ac1.info(f"🥈 対抗（2番手候補）: **{counter_boat}号艇**")
+    with ac2:
+        if fastest_tenji:
+            if fastest_tenji >= 3 and analysis.get("is_strong_headwind"):
+                ac2.warning(f"⚡ 展示一番時計: **{fastest_tenji}号艇**（向かい風で頭の可能性）")
+            else:
+                ac2.info(f"⏱️ 展示一番時計: **{fastest_tenji}号艇**")
+
 st.divider()
 
 # --- おすすめ買い目 ---
 st.subheader("おすすめ買い目（3連単）")
-for bet in recommend_bets(stadium, probabilities):
+bets = recommend_bets(probabilities, analysis)
+bet_count = len(bets)
+
+if race_type == "favorite":
+    st.caption(f"🎯 本命レース — {bet_count}点絞り込み（4〜8点）")
+elif race_type == "upset":
+    st.caption(f"⚡ 穴レース — {bet_count}点フォーメーション（12〜20点）")
+else:
+    st.caption(f"📊 通常レース — {bet_count}点フォーメーション（8〜12点）")
+
+for bet in bets:
     st.success(f"## {bet}")
 
 # --- 出走表（折りたたみ）---
@@ -496,7 +705,7 @@ if merged_racers:
         df = pd.DataFrame(merged_racers)
         display_cols = [
             "艇番", "選手名", "級別",
-            "展示タイム", "チルト",
+            "展示タイム", "チルト", "平均ST",
             "当地勝率", "全国勝率", "モーター2連率",
         ]
         df_display = df[[c for c in display_cols if c in df.columns]].set_index("艇番")
