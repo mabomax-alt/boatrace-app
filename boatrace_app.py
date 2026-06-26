@@ -631,8 +631,15 @@ elif race_type == "upset":
 else:
     st.info("📊 **通常レース** — 標準フォーメーションで安定を狙う。")
 
-# 予測を2列×3行で表示
-BOAT_COLORS = ["🔴", "⚫", "⬜", "🔵", "🟡", "🟢"]
+# 予測を2列×3行で表示（公式枠色カード）
+BOAT_FRAME_COLORS = [
+    {"bg": "#FFFFFF", "text": "#333333", "border": "#CCCCCC"},  # 1号艇：白
+    {"bg": "#1A1A1A", "text": "#FFFFFF", "border": "#555555"},  # 2号艇：黒
+    {"bg": "#E8001B", "text": "#FFFFFF", "border": "#C0001A"},  # 3号艇：赤
+    {"bg": "#0047AB", "text": "#FFFFFF", "border": "#003380"},  # 4号艇：青
+    {"bg": "#FFD700", "text": "#333333", "border": "#CCA800"},  # 5号艇：黄
+    {"bg": "#007A33", "text": "#FFFFFF", "border": "#005522"},  # 6号艇：緑
+]
 fastest_tenji = analysis.get("fastest_tenji_boat")
 counter_boat = analysis.get("counter_boat")
 
@@ -646,27 +653,45 @@ for row in range(3):
         tilt = r.get("チルト", 0.0)
         avg_st = r.get("平均ST", 0.0)
         boat_no = idx + 1
+        color = BOAT_FRAME_COLORS[idx]
 
         tags = []
         if tenji > 0:
-            tags.append(f"展示{tenji:.2f}")
+            tags.append(f"展示 {tenji:.2f}")
         if tilt != 0.0:
-            tags.append(f"チルト{tilt:+.1f}")
+            tags.append(f"チルト {tilt:+.1f}")
         if avg_st > 0:
-            tags.append(f"ST{avg_st:.2f}")
+            tags.append(f"ST {avg_st:.2f}")
         if fastest_tenji == boat_no:
-            tags.append("⚡一番時計")
+            tags.append("⚡ 一番時計")
         if counter_boat == boat_no:
-            tags.append("🥈対抗")
+            tags.append("🥈 対抗")
 
-        sub = "　".join(tags)
+        sub = " ／ ".join(tags)
+        prob_str = f"{probabilities[idx] * 100:.1f}"
+
+        card_html = f"""<div style="
+    background-color: {color['bg']};
+    color: {color['text']};
+    border: 2px solid {color['border']};
+    border-radius: 10px;
+    padding: 16px 12px;
+    margin-bottom: 8px;
+    text-align: center;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+">
+    <div style="font-size: 0.85em; font-weight: 600; margin-bottom: 4px;">
+        {boat_no}号艇 &nbsp; {name} &nbsp; {grade}
+    </div>
+    <div style="font-size: 2.2em; font-weight: bold; line-height: 1.1; margin: 4px 0;">
+        {prob_str}%
+    </div>
+    <div style="font-size: 0.75em; margin-top: 6px; opacity: 0.85;">
+        {sub if sub else "&nbsp;"}
+    </div>
+</div>"""
         with col:
-            st.metric(
-                label=f"{BOAT_COLORS[idx]} {boat_no}号艇　{name}　{grade}",
-                value=f"{probabilities[idx] * 100:.1f}%",
-                delta=sub if sub else None,
-                delta_color="off",
-            )
+            st.markdown(card_html, unsafe_allow_html=True)
 
 # --- 分析サマリー ---
 if counter_boat or fastest_tenji:
