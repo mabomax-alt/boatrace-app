@@ -518,6 +518,42 @@ def recommend_bets(probs: list, analysis: dict) -> list:
     return bets if bets else [f"{boats[0]}-{boats[1]}-{boats[2]}"]
 
 
+def _compress_bets(bets: list) -> list[dict]:
+    """買い目リストを (1着-2着) でグループ化しフォーメーション表記に圧縮する。
+
+    例: [1-2-3, 1-2-4, 1-2-5] → {"label": "1-2-3/4/5", "count": 3}
+        3着が残り全艇      → {"label": "1-3-全",     "count": 4}
+    """
+    parsed = []
+    for b in bets:
+        parts = b.split("-")
+        if len(parts) == 3:
+            try:
+                parsed.append((int(parts[0]), int(parts[1]), int(parts[2])))
+            except ValueError:
+                pass
+
+    groups: dict = {}
+    for a, b, c in parsed:
+        key = (a, b)
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(c)
+
+    result = []
+    for (a, b), thirds in sorted(groups.items()):
+        remaining = set(range(1, 7)) - {a, b}
+        if set(thirds) == remaining:
+            label = f"{a}-{b}-全"
+        elif len(thirds) >= 2:
+            label = f"{a}-{b}-" + "/".join(str(c) for c in sorted(thirds))
+        else:
+            label = f"{a}-{b}-{thirds[0]}"
+        result.append({"label": label, "count": len(thirds)})
+
+    return result
+
+
 # ===== UI =====
 
 st.set_page_config(page_title="ボートレース予測AI", page_icon="⚓", layout="centered")
@@ -755,14 +791,39 @@ bets = recommend_bets(probabilities, analysis)
 bet_count = len(bets)
 
 if race_type == "favorite":
-    st.caption(f"🎯 本命レース — {bet_count}点絞り込み（4〜8点）")
+    _bet_label, _bet_range = "🎯 本命レース", "4〜8点"
+    _chip_bg, _chip_fg = "#2d8a4e", "#ffffff"
 elif race_type == "upset":
-    st.caption(f"⚡ 穴レース — {bet_count}点フォーメーション（12〜20点）")
+    _bet_label, _bet_range = "⚡ 穴レース", "12〜20点"
+    _chip_bg, _chip_fg = "#c0392b", "#ffffff"
 else:
-    st.caption(f"📊 通常レース — {bet_count}点フォーメーション（8〜12点）")
+    _bet_label, _bet_range = "📊 通常レース", "8〜12点"
+    _chip_bg, _chip_fg = "#1a5fa8", "#ffffff"
 
-for bet in bets:
-    st.success(f"## {bet}")
+st.caption(f"{_bet_label} — 合計 **{bet_count}点**（目安: {_bet_range}）")
+
+formations = _compress_bets(bets)
+_chip_items = "".join(
+    f'<span style="display:inline-flex;align-items:center;gap:4px;'
+    f"background:{_chip_bg};color:{_chip_fg};"
+    f'border-radius:999px;padding:6px 16px;'
+    f'font-size:1.05em;font-weight:bold;white-space:nowrap;'
+    f'box-shadow:0 1px 4px rgba(0,0,0,0.25);">'
+    f'{f["label"]}'
+    + (
+        f'<span style="font-size:0.70em;opacity:0.80;margin-left:3px;">({f["count"]}点)</span>'
+        if f["count"] > 1
+        else ""
+    )
+    + "</span>"
+    for f in formations
+)
+st.markdown(
+    f'<div style="display:flex;flex-wrap:wrap;gap:10px;padding:8px 0;">'
+    f"{_chip_items}</div>"
+    f'<div style="font-size:0.82em;color:#888;margin-top:6px;">合計点数：{bet_count}点</div>',
+    unsafe_allow_html=True,
+)
 
 # --- 出走表（折りたたみ）---
 if merged_racers:
