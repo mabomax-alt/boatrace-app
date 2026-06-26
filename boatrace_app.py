@@ -275,7 +275,7 @@ def generate_prediction(
 
     ステップ1: 軸の決定（1号艇の精査）
     ステップ2: 対抗（2番手）の探索
-    ステップ3: 風と展示による展開補正
+    ステップ3: 風と展示による展開補正（波乱の警戒）
     ステップ4: レースタイプ判定（buy_recommendations と連動）
 
     Returns:
@@ -284,10 +284,11 @@ def generate_prediction(
     """
     probs = base_probs(stadium)[:]
     analysis: dict = {
-        "axis_type": "normal",      # "strong" | "normal" | "upset_risk"
-        "race_type": "normal",      # "favorite" | "normal" | "upset"
-        "counter_boat": None,       # 2番手候補の艇番（1-indexed）
-        "fastest_tenji_boat": None, # 展示一番時計の艇番（1-indexed）
+        "axis_type": "normal",       # "strong" | "normal" | "upset_risk"
+        "race_type": "normal",       # "favorite" | "normal" | "upset"
+        "counter_boat": None,        # 2番手筆頭の艇番（1-indexed）
+        "counter_boats": [],         # 対抗候補一覧（1-indexed）
+        "fastest_tenji_boat": None,  # 展示一番時計の艇番（1-indexed）
         "is_tailwind": False,
         "is_strong_headwind": False,
     }
@@ -332,47 +333,61 @@ def generate_prediction(
     others_nat = [r.get("全国勝率", 0.0) for r in racers[1:]]
     avg_others_nat = sum(others_nat) / max(len(others_nat), 1)
 
+    # 絶対的な本命: 勝率5.5以上かつ追い風
     if boat1_rate >= 5.5 and is_tailwind:
         axis_type = "strong"
-        probs[0] *= 1.20  # 本命強化
-    elif boat1_rate < 4.5 and (boat1_st > 0.18 or boat1_rate < avg_others_nat):
+        probs[0] *= 1.25
+    # 通常本命: 勝率5.5以上かつ強向かい風でない
+    elif boat1_rate >= 5.5 and not is_strong_headwind:
+        axis_type = "strong"
+        probs[0] *= 1.18
+    # イン飛び警戒: 勝率4.5未満かつSTが遅い（両条件を同時に要求）
+    elif boat1_rate < 4.5 and boat1_st > 0.18:
         axis_type = "upset_risk"
-        probs[0] *= 0.85  # イン飛び警戒
+        probs[0] *= 0.78
+        for i in range(1, 6):
+            probs[i] *= 1.04
+    # 波乱含み: 他艇平均を下回る勝率かつ5.0未満
+    elif boat1_rate < avg_others_nat and boat1_rate < 5.0:
+        axis_type = "upset_risk"
+        probs[0] *= 0.85
     else:
         axis_type = "normal"
 
     analysis["axis_type"] = axis_type
 
     # ===== ステップ2: 対抗（2番手）の探索 =====
-    # 2〜4号艇（センター勢）: 全国勝率最高 + モーター2連率40%以上を評価
-    counter_boat = None
-    counter_best = -1.0
+    # 2〜4号艇（センター勢）: 全国勝率最高 + モーター2連率40%以上を別々に評価
+    center_idxs = list(range(1, min(4, len(racers))))
+    counter_boats: list = []
 
-    for i in range(1, min(4, len(racers))):  # インデックス1〜3 → 2〜4号艇
-        r = racers[i]
-        nat_rate = r.get("全国勝率", 0.0)
-        motor2 = r.get("モーター2連率", 0.0)
-        score = nat_rate + (1.0 if motor2 >= 40 else 0.0)
-        if score > counter_best:
-            counter_best = score
-            counter_boat = i
+    if center_idxs:
+        # 全国勝率が最も高い艇を2着筆頭候補に
+        best_rate_idx = max(center_idxs, key=lambda i: racers[i].get("全国勝率", 0.0))
+        if racers[best_rate_idx].get("全国勝率", 0.0) > 0:
+            probs[best_rate_idx] *= 1.12
+            counter_boats.append(best_rate_idx + 1)
 
-    if counter_boat is not None:
-        probs[counter_boat] *= 1.10
-        if racers[counter_boat].get("モーター2連率", 0.0) >= 40:
-            probs[counter_boat] *= 1.05  # モーター好調でさらに加点
+        # モーター2連率40%以上の艇をさらに加点（2着・3着候補として評価）
+        for i in center_idxs:
+            if racers[i].get("モーター2連率", 0.0) >= 40.0:
+                probs[i] *= 1.08
+                if (i + 1) not in counter_boats:
+                    counter_boats.append(i + 1)
 
-    analysis["counter_boat"] = counter_boat + 1 if counter_boat is not None else None
+    analysis["counter_boat"] = counter_boats[0] if counter_boats else None
+    analysis["counter_boats"] = counter_boats
 
-    # ===== ステップ3: 風と展示による展開補正 =====
+    # ===== ステップ3: 風と展示による展開補正（波乱の警戒）=====
+    # 気象条件の判定: 風速5m/s以上かつ向かい風
     if is_strong_headwind:
-        probs[0] *= 0.90  # 向かい風強風でインをさらに弱体化
+        probs[0] *= 0.88  # インをさらに弱体化
         for i in range(2, 6):  # 3〜6号艇（ダッシュ勢）を強化
-            probs[i] *= 1.05
+            probs[i] *= 1.08
     elif is_tailwind and wind_speed >= 3.0:
-        probs[0] *= 1.05
+        probs[0] *= 1.06
 
-    # 展示タイム補正（速い艇を加点、一番時計艇を特定）
+    # 展示タイムの判定: 一番時計を特定し z スコアで全艇を補正
     tenji_times = [
         racers[i].get("展示タイム", 0.0) if i < len(racers) else 0.0
         for i in range(6)
@@ -381,9 +396,12 @@ def generate_prediction(
 
     if valid_times:
         mean_t = sum(valid_times) / len(valid_times)
+        std_t = (sum((t - mean_t) ** 2 for t in valid_times) / len(valid_times)) ** 0.5
+
         for i, t in enumerate(tenji_times):
-            if t > 0:
-                probs[i] = max(probs[i] + (mean_t - t) * 0.5, 0.001)
+            if t > 0 and std_t > 0:
+                z = (mean_t - t) / std_t  # 小さい（速い）ほど正の補正
+                probs[i] = max(probs[i] * (1.0 + z * 0.09), 0.001)
 
         fastest_idx = min(
             (i for i, t in enumerate(tenji_times) if t > 0),
@@ -393,7 +411,7 @@ def generate_prediction(
 
         # ダッシュ枠（3〜6号艇）の一番時計 × 向かい風 → 頭の可能性を強く加点
         if fastest_idx >= 2 and is_headwind:
-            probs[fastest_idx] *= 1.10
+            probs[fastest_idx] *= 1.15
 
     # チルト補正
     for i in range(min(len(racers), 6)):
@@ -427,58 +445,73 @@ def generate_prediction(
 
 
 def recommend_bets(probs: list, analysis: dict) -> list:
-    """ステップ4: レースタイプに応じた買い目絞り込み
+    """ステップ4: レースタイプに応じた買い目絞り込み（ガミり防止）
 
-    本命レース: 4〜8点（軸固定フォーメーション）
-    通常レース: 8〜12点（標準フォーメーション）
+    本命レース: 4〜8点（1号艇軸固定フォーメーション）
+    通常レース: 8〜12点（2軸フォーメーション）
     穴レース:  12〜20点（広フォーメーション）
     """
     race_type = analysis.get("race_type", "normal")
-    axis_type = analysis.get("axis_type", "normal")
+    fastest_tenji = analysis.get("fastest_tenji_boat")
+    is_strong_headwind = analysis.get("is_strong_headwind", False)
 
     ranking = sorted(range(6), key=lambda i: -probs[i])
     boats = [r + 1 for r in ranking]  # 確率高い順の艇番（1-indexed）
 
     if race_type == "favorite":
-        # 本命レース: 軸を1着固定、2着×3着をコンパクトに展開
-        axis = 1 if axis_type == "strong" else boats[0]
-        seconds = [b for b in boats if b != axis][:2]
-        thirds = [b for b in boats if b != axis][:3]
+        # 本命レース: 1号艇を1着に固定、確率上位選手で2着・3着を組む（4〜8点）
+        axis = 1
+        others = [b for b in boats if b != axis]
+        seconds = others[:2]
+        thirds = others[:3]
         bets = _gen_formations([axis], seconds, thirds)
 
         if len(bets) < 4:  # 最低4点保証
-            seconds = [b for b in boats if b != axis][:3]
-            thirds = [b for b in boats if b != axis][:4]
+            seconds = others[:3]
             bets = _gen_formations([axis], seconds, thirds)[:8]
         else:
             bets = bets[:8]
 
     elif race_type == "upset":
-        # 穴レース: 上位3艇が1着候補、上位5艇まで3着候補に広げる
+        # 穴レース: 上位3艇が1着候補、上位5艇まで3着候補に広げる（12〜20点）
         firsts = boats[:3]
+
+        # 強向かい風 × ダッシュ枠一番時計 → その艇を1着筆頭に追加
+        if fastest_tenji and fastest_tenji >= 3 and is_strong_headwind:
+            firsts_set = set(firsts)
+            firsts_set.add(fastest_tenji)
+            firsts = [fastest_tenji] + [b for b in boats if b in firsts_set and b != fastest_tenji][:2]
+
         seconds = boats[:4]
         thirds = boats[:5]
-        bets = _gen_formations(firsts, seconds, thirds)[:20]
+        bets = _gen_formations(firsts, seconds, thirds)
 
         if len(bets) < 12:  # 最低12点保証
             firsts = boats[:4]
             bets = _gen_formations(firsts, seconds, thirds)[:20]
+        else:
+            bets = bets[:20]
 
     else:
-        # 通常レース: 軸1着+対抗1着の2軸フォーメーション
+        # 通常レース: 2軸フォーメーション（8〜12点）
         axis = boats[0]
-        seconds = [b for b in boats if b != axis][:3]
-        thirds = [b for b in boats if b != axis][:4]
+        others = [b for b in boats if b != axis]
+        seconds = others[:3]
+        thirds = others[:4]
         bets = _gen_formations([axis], seconds, thirds)
 
         # 2番手を1着に立てた追加フォーメーション
         if len(boats) >= 2:
             axis2 = boats[1]
-            s2 = [b for b in boats[:4] if b != axis2]
-            t2 = [b for b in boats[:5] if b != axis2]
+            s2 = [b for b in boats[:4] if b != axis2][:3]
+            t2 = [b for b in boats[:5] if b != axis2][:4]
             extra = _gen_formations([axis2], s2, t2)
-            all_bets = list(dict.fromkeys(bets + extra))[:12]
-            bets = all_bets
+            bets = list(dict.fromkeys(bets + extra))
+
+        # 8点に満たない場合は広げて補完、12点超えたら絞る
+        if len(bets) < 8:
+            add = _gen_formations(boats[:2], boats[:4], boats[:5])
+            bets = list(dict.fromkeys(bets + add))[:12]
         else:
             bets = bets[:12]
 
@@ -642,6 +675,8 @@ BOAT_FRAME_COLORS = [
 ]
 fastest_tenji = analysis.get("fastest_tenji_boat")
 counter_boat = analysis.get("counter_boat")
+counter_boats_list = analysis.get("counter_boats", [])
+axis_type = analysis.get("axis_type", "normal")
 
 for row in range(3):
     left, right = st.columns(2)
@@ -664,8 +699,12 @@ for row in range(3):
             tags.append(f"ST {avg_st:.2f}")
         if fastest_tenji == boat_no:
             tags.append("⚡ 一番時計")
-        if counter_boat == boat_no:
+        if boat_no in counter_boats_list:
             tags.append("🥈 対抗")
+        if axis_type == "strong" and boat_no == 1:
+            tags.append("⚓ 本命軸")
+        elif axis_type == "upset_risk" and boat_no == 1:
+            tags.append("⚠️ 注意")
 
         sub = " ／ ".join(tags)
         prob_str = f"{probabilities[idx] * 100:.1f}"
@@ -694,11 +733,13 @@ for row in range(3):
             st.markdown(card_html, unsafe_allow_html=True)
 
 # --- 分析サマリー ---
-if counter_boat or fastest_tenji:
+counter_boats_display = analysis.get("counter_boats", [])
+if counter_boats_display or fastest_tenji:
     ac1, ac2 = st.columns(2)
     with ac1:
-        if counter_boat:
-            ac1.info(f"🥈 対抗（2番手候補）: **{counter_boat}号艇**")
+        if counter_boats_display:
+            boats_str = "・".join([f"{b}号艇" for b in counter_boats_display])
+            ac1.info(f"🥈 対抗（2番手候補）: **{boats_str}**")
     with ac2:
         if fastest_tenji:
             if fastest_tenji >= 3 and analysis.get("is_strong_headwind"):
