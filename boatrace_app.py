@@ -234,6 +234,126 @@ def _parse_weather(soup: BeautifulSoup) -> dict:
     return result
 
 
+# ===== 今節成績 =====
+
+@st.cache_data(ttl=3600)
+def fetch_race_result(jcd: str, date_str: str, rno: int) -> list:
+    """完了レースの着順・艇番・選手名を取得する（1時間キャッシュ）。"""
+    url = f"{BASE_URL}/raceresult?jcd={jcd}&hd={date_str}&rno={rno:02d}"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.content, "html.parser")
+        return _parse_race_result(soup)
+    except Exception:
+        return []
+
+
+def _parse_race_result(soup: BeautifulSoup) -> list:
+    """raceresult ページから着順・艇番・選手名を抽出する。"""
+    results: list = []
+    seen_ranks: set = set()
+
+    for table in soup.find_all("table"):
+        for tr in table.find_all("tr"):
+            tds = tr.find_all("td")
+            if len(tds) < 4:
+                continue
+            rank_text = tds[0].get_text(strip=True)
+            if not rank_text.isdigit():
+                continue
+            rank = int(rank_text)
+            if rank < 1 or rank > 6 or rank in seen_ranks:
+                continue
+            boat_text = tds[1].get_text(strip=True)
+            if not boat_text.isdigit():
+                continue
+            boat_num = int(boat_text)
+            if not (1 <= boat_num <= 6):
+                continue
+            name = ""
+            for td in tds[2:6]:
+                text = td.get_text(strip=True)
+                if re.search(r'[぀-鿿]', text) and 2 <= len(text) <= 12:
+                    name = text
+                    break
+            results.append({"着順": rank, "艇番": boat_num, "選手名": name})
+            seen_ranks.add(rank)
+        if len(results) >= 6:
+            break
+
+    return sorted(results, key=lambda x: x["着順"])
+
+
+def _accumulate_results(totals: dict, race_results: list) -> None:
+    """1レースの結果を選手別成績に累計加算する。"""
+    for r in race_results:
+        name = r.get("選手名", "").strip()
+        if not name:
+            continue
+        if name not in totals:
+            totals[name] = {"1着": 0, "2着": 0, "出走": 0}
+        totals[name]["出走"] += 1
+        rank = r.get("着順", 9)
+        if rank == 1:
+            totals[name]["1着"] += 1
+        elif rank == 2:
+            totals[name]["2着"] += 1
+
+
+@st.cache_data(ttl=300)
+def fetch_setsunai_results(jcd: str, date_str: str, current_rno: int) -> dict:
+    """今節の全レース（初日〜当日の直前レースまで）を集計し選手別成績を返す。
+
+    今節期間: 当日の前レース全件 + 最大5日前まで遡り（結果が存在する日のみ）
+
+    Returns: {選手名: {"1着": n, "2着": n, "出走": n}}
+    """
+    from datetime import datetime, timedelta
+
+    totals: dict = {}
+    base_date = datetime.strptime(date_str, "%Y%m%d")
+
+    for rno in range(1, current_rno):
+        _accumulate_results(totals, fetch_race_result(jcd, date_str, rno))
+
+    for days_back in range(1, 6):
+        prev_date = base_date - timedelta(days=days_back)
+        prev_date_str = prev_date.strftime("%Y%m%d")
+        if not fetch_race_result(jcd, prev_date_str, 1):
+            break
+        for rno in range(1, 13):
+            race_res = fetch_race_result(jcd, prev_date_str, rno)
+            if not race_res:
+                break
+            _accumulate_results(totals, race_res)
+
+    return totals
+
+
+def identify_hot_players(setsunai_results: dict) -> dict:
+    """今節好調選手を特定し補正係数を返す。
+
+    好調条件（出走2以上）:
+      1着2以上 → 1.15 / 1着1かつトップ2率50%以上 → 1.10 / トップ2率60%以上 → 1.08
+    """
+    hot: dict = {}
+    for name, stats in setsunai_results.items():
+        runs = stats["出走"]
+        wins = stats["1着"]
+        top2 = wins + stats["2着"]
+        if runs < 2:
+            continue
+        top2_rate = top2 / runs
+        if wins >= 2:
+            hot[name] = 1.15
+        elif wins >= 1 and top2_rate >= 0.5:
+            hot[name] = 1.10
+        elif top2_rate >= 0.6:
+            hot[name] = 1.08
+    return hot
+
+
 # ===== 予測ロジック =====
 
 def base_probs(stadium: str) -> list:
@@ -270,6 +390,7 @@ def generate_prediction(
     wind_speed: float,
     wind_dir_code: int,
     racers: list,
+    hot_players: dict | None = None,
 ) -> tuple[list, dict]:
     """4ステップのルールベース重み付けでAI予測確率を生成する。
 
@@ -291,6 +412,7 @@ def generate_prediction(
         "fastest_tenji_boat": None,  # 展示一番時計の艇番（1-indexed）
         "is_tailwind": False,
         "is_strong_headwind": False,
+        "hot_boats": [],             # 今節好調選手の艇番一覧（1-indexed）
     }
 
     is_tailwind = wind_dir_code in _TAIL_WIND_CODES
@@ -431,6 +553,20 @@ def generate_prediction(
 
     total = sum(probs)
     probs = [p / total for p in probs]
+
+    # ===== 今節好調選手補正 =====
+    hot_in_race: list = []
+    if hot_players:
+        for i, r in enumerate(racers):
+            name = r.get("選手名", "").strip()
+            boost = hot_players.get(name, 1.0)
+            if boost > 1.0:
+                probs[i] *= boost
+                hot_in_race.append(i + 1)
+        if hot_in_race:
+            total = sum(probs)
+            probs = [p / total for p in probs]
+    analysis["hot_boats"] = hot_in_race
 
     # ===== ステップ4: レースタイプ判定 =====
     if axis_type == "strong" and not is_strong_headwind:
@@ -584,6 +720,8 @@ _SS_DEFAULTS = {
     "fetch_url": "",
     "wind_dir_code": 0,
     "wind_speed_val": 2.0,
+    "setsunai_results": {},
+    "hot_players": {},
 }
 for _k, _v in _SS_DEFAULTS.items():
     if _k not in st.session_state:
@@ -648,6 +786,13 @@ if fetch_btn:
     else:
         st.success(f"出走表＋直前情報（展示タイム・チルト・気象）を取得しました！")
 
+    # 今節成績を集計（初日〜当日の直前レースまで全件）
+    if not err_race and st.session_state.racers:
+        with st.spinner("今節成績を集計中（過去レース解析）..."):
+            setsunai = fetch_setsunai_results(jcd, date_str, int(race_num))
+            st.session_state.setsunai_results = setsunai
+            st.session_state.hot_players = identify_hot_players(setsunai)
+
 # --- 表示用に出走表と直前情報をマージ ---
 racers = st.session_state.racers
 before_data = st.session_state.before_data
@@ -679,10 +824,14 @@ _EMPTY_ANALYSIS: dict = {
     "axis_type": "normal", "race_type": "normal",
     "counter_boat": None, "fastest_tenji_boat": None,
     "is_tailwind": False, "is_strong_headwind": False,
+    "hot_boats": [],
 }
 
 try:
-    probabilities, analysis = generate_prediction(stadium, wind_speed, wind_dir_code, merged_racers)
+    probabilities, analysis = generate_prediction(
+        stadium, wind_speed, wind_dir_code, merged_racers,
+        st.session_state.get("hot_players", {}),
+    )
     if len(probabilities) != 6:
         raise ValueError(f"予測値が6艇分ありません（{len(probabilities)}艇分）")
 except Exception as e:
@@ -713,6 +862,7 @@ fastest_tenji = analysis.get("fastest_tenji_boat")
 counter_boat = analysis.get("counter_boat")
 counter_boats_list = analysis.get("counter_boats", [])
 axis_type = analysis.get("axis_type", "normal")
+hot_boats_list = analysis.get("hot_boats", [])
 
 for row in range(3):
     left, right = st.columns(2)
@@ -741,6 +891,8 @@ for row in range(3):
             tags.append("⚓ 本命軸")
         elif axis_type == "upset_risk" and boat_no == 1:
             tags.append("⚠️ 注意")
+        if boat_no in hot_boats_list:
+            tags.append("🔥 今節好調")
 
         sub = " ／ ".join(tags)
         prob_str = f"{probabilities[idx] * 100:.1f}"
@@ -839,5 +991,27 @@ if merged_racers:
         st.dataframe(df_display, use_container_width=True)
         if st.session_state.fetch_url:
             st.caption(f"出走表URL: {st.session_state.fetch_url}")
+
+# --- 今節成績（折りたたみ）---
+_setsunai = st.session_state.get("setsunai_results", {})
+if _setsunai:
+    st.divider()
+    with st.expander("今節成績（節間パフォーマンス）"):
+        _hot_names = set(st.session_state.get("hot_players", {}).keys())
+        _rows = []
+        for _name, _stats in _setsunai.items():
+            _runs = _stats["出走"]
+            _top2 = _stats["1着"] + _stats["2着"]
+            _rows.append({
+                "選手名": f"🔥 {_name}" if _name in _hot_names else _name,
+                "出走": _runs,
+                "1着": _stats["1着"],
+                "2着": _stats["2着"],
+                "トップ2率": f"{_top2 / _runs * 100:.0f}%" if _runs > 0 else "-",
+            })
+        if _rows:
+            _df_sets = pd.DataFrame(_rows).sort_values("1着", ascending=False)
+            st.dataframe(_df_sets.set_index("選手名"), use_container_width=True)
+            st.caption("🔥 = 今節好調選手（AI予測に補正済み）")
 else:
     st.info("「データ取得」を押すと boatrace.jp から出走表を取得し、予測精度が向上します。")
